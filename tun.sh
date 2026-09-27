@@ -273,12 +273,41 @@ default_via_tun() {
   [[ "$dev" == "$tun_dev" ]]
 }
 
+ssh_fail_reason() {
+  local rc="$1" msg="$2"
+  if (( rc == 124 )); then
+    printf 'timed out'
+    return 0
+  fi
+  # First non-empty line of stderr, with the routine prefix stripped.
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf '%s' "${line#ssh: }"
+    return 0
+  done <<<"$msg"
+  printf 'connection failed'
+  return 0
+}
+
+# Probe whether the server answers ssh. Sets REMOTE_ERR to "" on
+# success or a short human-readable reason on failure.
 remote_reachable() {
-  local host="$1" port="$2" user="$3"
-  timeout 4 ssh -p "$port" \
-    -o BatchMode=yes -o ConnectTimeout=3 \
-    -o StrictHostKeyChecking=accept-new \
-    "$user@$host" true </dev/null &>/dev/null
+  local host="$1" port="$2" user="$3" err rc
+  if err=$(timeout 4 ssh -p "$port" \
+        -o BatchMode=yes -o ConnectTimeout=3 \
+        -o StrictHostKeyChecking=accept-new \
+        "$user@$host" true </dev/null 2>&1); then
+    rc=0
+  else
+    rc=$?
+  fi
+  if (( rc == 0 )); then
+    REMOTE_ERR=""
+    return 0
+  fi
+  REMOTE_ERR="$(ssh_fail_reason "$rc" "$err")"
+  return 1
 }
 
 require_root() {
@@ -524,13 +553,22 @@ Status() {
     any=1
 
     # Probe validity in a subshell so a broken config doesn't abort
-    # the whole report.
-    if ! ( load_server_config "$id" ) >/dev/null 2>&1; then
+    # the whole report. Its stderr becomes the error detail.
+    local cfg_err=""
+    if cfg_err="$( ( load_server_config "$id" ) 2>&1 >/dev/null )"; then
+      cfg_err=""
+      load_server_config "$id"
+    else
+      local err_line="${cfg_err%%$'\n'*}"
+      err_line="${err_line#Error: }"
       printf '  [%s]\n' "$id"
-      printf '    Config:            %s\n' "$(paint red INVALID)"
+      if [[ -n "$err_line" ]]; then
+        printf '    Config:            %s  (%s)\n' "$(paint red INVALID)" "$err_line"
+      else
+        printf '    Config:            %s\n' "$(paint red INVALID)"
+      fi
       continue
     fi
-    load_server_config "$id"
 
     local tun_dev="tun$id"
     local host="${SERVER[HOST]}"
@@ -565,7 +603,15 @@ Status() {
 
     if (( installed )); then
       printf '    Service installed: yes\n'
-      printf '    Service state:     %s\n' "$(paint_service_state "$svc_state")"
+      if [[ "$svc_state" == "failed" ]]; then
+        local fail_res
+        fail_res=$(systemctl show -p Result "$(service_name "$id")" 2>/dev/null \
+          | cut -d= -f2- || true)
+        printf '    Service state:     %s  (systemd result: %s)\n' \
+          "$(paint red failed)" "${fail_res:-unknown}"
+      else
+        printf '    Service state:     %s\n' "$(paint_service_state "$svc_state")"
+      fi
     else
       printf '    Service installed: no\n'
     fi
@@ -573,7 +619,7 @@ Status() {
     if (( tun_up )); then
       printf '    Tun up:            %s\n' "$(paint green yes)"
     elif (( running )); then
-      printf '    Tun up:            %s\n' "$(paint red no)"
+      printf '    Tun up:            %s  (%s missing)\n' "$(paint red no)" "$tun_dev"
     else
       printf '    Tun up:            no\n'
     fi
@@ -581,7 +627,7 @@ Status() {
     if (( exc_route )); then
       printf '    Exception route:   %s\n' "$(paint green yes)"
     elif (( tun_up || running )); then
-      printf '    Exception route:   %s\n' "$(paint red no)"
+      printf '    Exception route:   %s  (none for %s)\n' "$(paint red no)" "$host"
     else
       printf '    Exception route:   no\n'
     fi
@@ -595,7 +641,7 @@ Status() {
     if (( reachable )); then
       printf '    Remote reachable:  %s\n' "$(paint green yes)"
     elif (( running )); then
-      printf '    Remote reachable:  %s\n' "$(paint red no)"
+      printf '    Remote reachable:  %s  (%s)\n' "$(paint red no)" "${REMOTE_ERR:-unknown}"
     else
       printf '    Remote reachable:  no\n'
     fi
