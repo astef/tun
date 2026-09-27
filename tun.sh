@@ -72,6 +72,7 @@ $TUN_D_DIR/<id>.sh, which declares:
     [HOST]="1.2.3.4"
     [USER]="root"
     [SSH_PORT]="22"   # optional, defaults to 22
+    [DESC]="RU-0"     # optional, human-readable label
   )
 
 Tunnel IPs live in the global section of this script. System-specific
@@ -223,6 +224,7 @@ load_server_config() {
   [[ -n "${SERVER[HOST]:-}" ]] || die "server config missing [HOST]: $file"
   [[ -n "${SERVER[USER]:-}" ]] || die "server config missing [USER]: $file"
   [[ -v "SERVER[SSH_PORT]" ]] || SERVER[SSH_PORT]=22
+  [[ -v "SERVER[DESC]" ]] || SERVER[DESC]=""
   SERVER_ID="$id"
 }
 
@@ -231,6 +233,16 @@ load_server_config() {
 # ==================================================================
 
 service_name() { echo "tun@$1.service"; }
+
+# " (DESC)" when the loaded server declares a human-readable [DESC],
+# empty string otherwise. Used in human-facing output.
+server_label() {
+  local desc="${SERVER[DESC]:-}"
+  if [[ -n "$desc" ]]; then
+    printf ' (%s)' "$desc"
+  fi
+  return 0
+}
 
 service_installed() { systemctl cat "$(service_name "$1")" &>/dev/null; }
 service_state()     { systemctl is-active "$(service_name "$1")" 2>/dev/null || true; }
@@ -305,7 +317,7 @@ EOF
   fi
 
   systemctl enable "$(service_name "$id")"
-  echo "Installed: $id (enabled, not started)"
+  echo "Installed: $id$(server_label) (enabled, not started)"
 }
 
 Remove() {
@@ -322,7 +334,7 @@ Remove() {
   fi
   systemctl disable "$(service_name "$id")" 2>/dev/null || true
   remove_exception_route "${SERVER[HOST]}"
-  echo "Removed: $id"
+  echo "Removed: $id$(server_label)"
 }
 
 Start() {
@@ -369,7 +381,7 @@ Start() {
       "ip addr replace $SERVER_TUN_IP/32 peer $CLIENT_TUN_IP dev $tun_dev; \
        ip link set $tun_dev up"
 
-  echo "Started: $id"
+  echo "Started: $id$(server_label)"
 }
 
 Stop() {
@@ -391,7 +403,7 @@ Stop() {
   fi
   ip link del "$tun_dev" 2>/dev/null || true
 
-  echo "Stopped: $id"
+  echo "Stopped: $id$(server_label)"
 }
 
 Use() {
@@ -414,7 +426,7 @@ Use() {
 
   ensure_exception_route "${SERVER[HOST]}"
   ip route replace default via "$SERVER_TUN_IP" dev "$tun_dev"
-  echo "Default route now via server $id ($tun_dev -> $SERVER_TUN_IP)"
+  echo "Default route now via server $id$(server_label) ($tun_dev -> $SERVER_TUN_IP)"
 }
 
 # ==================================================================
@@ -524,6 +536,7 @@ Status() {
     local host="${SERVER[HOST]}"
     local user="${SERVER[USER]}"
     local port="${SERVER[SSH_PORT]}"
+    local desc="${SERVER[DESC]:-}"
 
     # --- Per-server state, gathered before printing ---
     local svc_state="" installed=0 tun_up=0 exc_route=0 carries=0 reachable=0
@@ -542,7 +555,11 @@ Status() {
     local running=0
     [[ "$svc_state" == "active" ]] && running=1
 
-    printf '  [%s]\n' "$id"
+    if [[ -n "$desc" ]]; then
+      printf '  [%s]  %s\n' "$id" "$desc"
+    else
+      printf '  [%s]\n' "$id"
+    fi
     printf '    Host:              %s@%s:%s\n' "$user" "$host" "$port"
     printf '    Tun device:        %s\n' "$tun_dev"
 
