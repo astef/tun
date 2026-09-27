@@ -417,19 +417,92 @@ Use() {
   echo "Default route now via server $id ($tun_dev -> $SERVER_TUN_IP)"
 }
 
+# ==================================================================
+# Colors (status output only)
+# ==================================================================
+#
+# Palette semantics: green = healthy/active, yellow = needs attention,
+# red = broken. Colors are disabled when stdout is not a terminal or
+# when NO_COLOR is set, so piping status through grep/less stays clean.
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RED=$'\033[0;31m'
+  C_YELLOW=$'\033[0;33m'
+  C_GREEN=$'\033[0;32m'
+  C_RESET=$'\033[0m'
+else
+  C_RED=""
+  C_YELLOW=""
+  C_GREEN=""
+  C_RESET=""
+fi
+
+# Print $2 wrapped in $1's color. $1 is one of: red, yellow, green,
+# or empty (plain text).
+paint() {
+  local color="$1" text="$2"
+  case "$color" in
+    red)    printf '%s%s%s' "$C_RED"    "$text" "$C_RESET" ;;
+    yellow) printf '%s%s%s' "$C_YELLOW" "$text" "$C_RESET" ;;
+    green)  printf '%s%s%s' "$C_GREEN"  "$text" "$C_RESET" ;;
+    *)      printf '%s' "$text" ;;
+  esac
+}
+
+# Color for a systemd active-state value.
+paint_service_state() {
+  local v="$1"
+  case "$v" in
+    active)   paint green "$v" ;;
+    failed)   paint red "$v" ;;
+    inactive) paint yellow "$v" ;;
+    *)        printf '%s' "$v" ;;
+  esac
+}
+
 Status() {
   require ip ssh systemctl
   load_local_config
 
+  # --- Global state, gathered once up front ---
+  local lo_color=""
+  case "$LOCAL_CONFIG_SOURCE" in
+    file)                          lo_color=green ;;
+    generated)                     lo_color=yellow ;;
+    auto-detected\ \(not\ saved\)) lo_color=red ;;
+    *)                             lo_color="" ;;
+  esac
+
+  local iface_ok=0
+  tun_exists "$REAL_IFACE" && iface_ok=1
+
+  local def_line="" def_dev=""
+  def_line=$(ip route show default 2>/dev/null | head -1 || true)
+  if [[ -n "$def_line" ]]; then
+    def_dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$def_line")
+  fi
+
+  # --- Print ---
   echo "=== Global ==="
   printf '  Script:          %s\n' "$SCRIPT_PATH"
-  printf '  Local config:     %s (%s)\n' "$LOCAL_CONFIG" "$LOCAL_CONFIG_SOURCE"
-  printf '  REAL_IFACE:      %s\n' "$REAL_IFACE"
+  printf '  Local config:     %s (%s)\n' \
+    "$LOCAL_CONFIG" "$(paint "$lo_color" "$LOCAL_CONFIG_SOURCE")"
+  if (( iface_ok )); then
+    printf '  REAL_IFACE:      %s\n' "$REAL_IFACE"
+  else
+    printf '  REAL_IFACE:      %s\n' "$(paint red "$REAL_IFACE (missing)")"
+  fi
   printf '  REAL_GATEWAY:    %s\n' "$REAL_GATEWAY"
   printf '  CLIENT_TUN_IP:   %s\n' "$CLIENT_TUN_IP"
   printf '  SERVER_TUN_IP:   %s\n' "$SERVER_TUN_IP"
-  printf '  Current default: %s\n' \
-    "$(ip route show default 2>/dev/null | head -1 || echo '<none>')"
+
+  if [[ -z "$def_line" ]]; then
+    printf '  Current default: %s\n' "$(paint red '<none>')"
+  elif [[ "$def_dev" == tun* ]]; then
+    printf '  Current default: %s\n' "$(paint green "$def_line")"
+  else
+    printf '  Current default: %s\n' "$def_line"
+  fi
 
   echo
   echo "=== Servers ==="
@@ -437,12 +510,12 @@ Status() {
   local id any=0
   while IFS= read -r id; do
     any=1
-    printf '  [%s]\n' "$id"
 
     # Probe validity in a subshell so a broken config doesn't abort
     # the whole report.
     if ! ( load_server_config "$id" ) >/dev/null 2>&1; then
-      printf '    Config:            INVALID\n'
+      printf '  [%s]\n' "$id"
+      printf '    Config:            %s\n' "$(paint red INVALID)"
       continue
     fi
     load_server_config "$id"
@@ -452,31 +525,63 @@ Status() {
     local user="${SERVER[USER]}"
     local port="${SERVER[SSH_PORT]}"
 
+    # --- Per-server state, gathered before printing ---
+    local svc_state="" installed=0 tun_up=0 exc_route=0 carries=0 reachable=0
+    if service_installed "$id"; then
+      installed=1
+      svc_state="$(service_state "$id")"
+    fi
+    tun_exists "$tun_dev" && tun_up=1
+    exception_route_exists "$host" && exc_route=1
+    default_via_tun "$tun_dev" && carries=1
+    remote_reachable "$host" "$port" "$user" && reachable=1
+
+    # "running" = the unit claims this tunnel should be up right now.
+    # No/red states below only count as broken when something says
+    # they should be present.
+    local running=0
+    [[ "$svc_state" == "active" ]] && running=1
+
+    printf '  [%s]\n' "$id"
     printf '    Host:              %s@%s:%s\n' "$user" "$host" "$port"
     printf '    Tun device:        %s\n' "$tun_dev"
 
-    if service_installed "$id"; then
+    if (( installed )); then
       printf '    Service installed: yes\n'
-      printf '    Service state:     %s\n' "$(service_state "$id")"
+      printf '    Service state:     %s\n' "$(paint_service_state "$svc_state")"
     else
       printf '    Service installed: no\n'
     fi
 
-    tun_exists "$tun_dev" \
-      && printf '    Tun up:            yes\n' \
-      || printf '    Tun up:            no\n'
+    if (( tun_up )); then
+      printf '    Tun up:            %s\n' "$(paint green yes)"
+    elif (( running )); then
+      printf '    Tun up:            %s\n' "$(paint red no)"
+    else
+      printf '    Tun up:            no\n'
+    fi
 
-    exception_route_exists "$host" \
-      && printf '    Exception route:   yes\n' \
-      || printf '    Exception route:   no\n'
+    if (( exc_route )); then
+      printf '    Exception route:   %s\n' "$(paint green yes)"
+    elif (( tun_up || running )); then
+      printf '    Exception route:   %s\n' "$(paint red no)"
+    else
+      printf '    Exception route:   no\n'
+    fi
 
-    default_via_tun "$tun_dev" \
-      && printf '    Carries default:   YES\n' \
-      || printf '    Carries default:   no\n'
+    if (( carries )); then
+      printf '    Carries default:   %s\n' "$(paint green YES)"
+    else
+      printf '    Carries default:   no\n'
+    fi
 
-    remote_reachable "$host" "$port" "$user" \
-      && printf '    Remote reachable:  yes\n' \
-      || printf '    Remote reachable:  no\n'
+    if (( reachable )); then
+      printf '    Remote reachable:  %s\n' "$(paint green yes)"
+    elif (( running )); then
+      printf '    Remote reachable:  %s\n' "$(paint red no)"
+    else
+      printf '    Remote reachable:  no\n'
+    fi
   done < <(server_ids)
 
   if (( any == 0 )); then
