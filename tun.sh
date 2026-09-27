@@ -8,28 +8,24 @@ SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 
 readonly PROG="$(basename "$0")"
 readonly TUN_D_DIR="$SCRIPT_DIR/tun.d"
+readonly LOCAL_CONFIG="$TUN_D_DIR/localhost.sh"
 readonly UNIT_PATH="/etc/systemd/system/tun@.service"
 
 # ==================================================================
 # Global network configuration
 # ==================================================================
 #
-# REAL_IFACE / REAL_GATEWAY: your physical interface and its gateway.
-# Find them with:
+# System-specific values (REAL_IFACE, REAL_GATEWAY, ...) live in
+# $LOCAL_CONFIG, not here. That file is generated on first use with
+# best-effort auto-detected values:
 #
 #     ip route | grep '^default'
-#
-# Example output:
-#
 #     default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.42 metric 100
+#         REAL_IFACE   = token after "dev"
+#         REAL_GATEWAY = token after "via"
 #
-# REAL_IFACE   = token after "dev"
-# REAL_GATEWAY = token after "via"
-#
-# These don't change mid-connection, so hardcode them.
-
-REAL_IFACE="eth0"
-REAL_GATEWAY="192.168.1.1"
+# These don't change mid-connection, so they're hardcoded in that file.
+# What follows here is global: sensible on any system as-is.
 
 # Tunnel addresses. Shared across servers because every server gets its
 # own tun<id> interface, so they never collide.
@@ -78,8 +74,9 @@ $TUN_D_DIR/<id>.sh, which declares:
     [SSH_PORT]="22"   # optional, defaults to 22
   )
 
-Tunnel IPs, REAL_IFACE and REAL_GATEWAY live in the global section of
-this script.
+Tunnel IPs live in the global section of this script. System-specific
+values (REAL_IFACE, REAL_GATEWAY) live in $TUN_D_DIR/localhost.sh,
+auto-generated with best-effort detection on first use.
 
 Examples:
   $PROG install 1
@@ -94,6 +91,91 @@ EOF
 # Config plumbing (private)
 # ==================================================================
 
+# Best-effort: find a physical (non-tun) default route and print
+# "<iface> <gateway>". Empty output means detection failed.
+detect_real_route() {
+  local route dev via
+
+  # Scan the routing table's default routes, skipping any that go
+  # through a tun device (i.e. this very VPN when it's up).
+  while IFS= read -r route; do
+    [[ -z "$route" ]] && continue
+    dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$route")
+    [[ -n "$dev" && "$dev" != tun* ]] || continue
+    via=$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$route")
+    printf '%s %s\n' "$dev" "$via"
+    return 0
+  done < <(ip route show default 2>/dev/null)
+
+  # No usable default route: ask the kernel how it would reach the
+  # internet instead.
+  route=$(ip route get 8.8.8.8 2>/dev/null | head -1 || true)
+  [[ -z "$route" ]] && return 1
+  dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$route")
+  [[ -n "$dev" && "$dev" != tun* ]] || return 1
+  via=$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$route")
+  printf '%s %s\n' "$dev" "$via"
+  return 0
+}
+
+# Load system-specific values (REAL_IFACE, REAL_GATEWAY, ...) from
+# $LOCAL_CONFIG. When the file is missing, generate it with
+# best-effort auto-detected values. If the file cannot be written
+# (e.g. not run as root and the dir is not writable), fall back to
+# detected values in memory for this run only.
+load_local_config() {
+  LOCAL_CONFIG_SOURCE="file"
+
+  if [[ ! -f "$LOCAL_CONFIG" ]]; then
+    local line iface gateway
+    line=$(detect_real_route || true)
+    if [[ -n "$line" ]]; then
+      read -r iface gateway <<<"$line"
+    else
+      iface=""
+      gateway=""
+    fi
+
+    if {
+         cat > "$LOCAL_CONFIG" <<EOF
+# $PROG system-specific configuration (auto-generated).
+#
+# REAL_IFACE / REAL_GATEWAY: your physical interface and its gateway.
+# Find them with:
+#
+#     ip route | grep '^default'
+#
+# Example output:
+#
+#     default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.42 metric 100
+#
+# REAL_IFACE   = token after "dev"
+# REAL_GATEWAY = token after "via"
+#
+# Auto-detection is best-effort. If these values look wrong or are
+# empty, edit this file and set them manually.
+
+REAL_IFACE="$iface"
+REAL_GATEWAY="$gateway"
+EOF
+       } 2>/dev/null; then
+      LOCAL_CONFIG_SOURCE="generated"
+      echo "Note: generated $LOCAL_CONFIG with auto-detected values (review it)." >&2
+    else
+      LOCAL_CONFIG_SOURCE="auto-detected (not saved)"
+      REAL_IFACE="$iface"
+      REAL_GATEWAY="$gateway"
+      echo "Warning: cannot write $LOCAL_CONFIG; using auto-detected values for this run." >&2
+      return 0
+    fi
+  fi
+
+  . "$LOCAL_CONFIG"
+
+  [[ -n "${REAL_IFACE:-}" && -n "${REAL_GATEWAY:-}" ]] || \
+    die "$LOCAL_CONFIG is incomplete: set non-empty REAL_IFACE and REAL_GATEWAY"
+}
+
 validate_id() {
   local id="$1"
   [[ "$id" =~ ^[0-9]+$ ]] || die "server id must be an integer: '$id'"
@@ -106,6 +188,7 @@ server_ids() {
   for f in "$TUN_D_DIR"/*.sh; do
     [[ -f "$f" ]] || continue
     id=$(basename "$f" .sh)
+    [[ "$id" == "localhost" ]] && continue
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then
       echo "Warning: ignoring non-numeric config: $f" >&2
       continue
@@ -180,10 +263,10 @@ default_via_tun() {
 
 remote_reachable() {
   local host="$1" port="$2" user="$3"
-  timeout 2 ssh -p "$port" \
-    -o BatchMode=yes -o ConnectTimeout=1 \
+  timeout 4 ssh -p "$port" \
+    -o BatchMode=yes -o ConnectTimeout=3 \
     -o StrictHostKeyChecking=accept-new \
-    "$user@$host" true &>/dev/null
+    "$user@$host" true </dev/null &>/dev/null
 }
 
 require_root() {
@@ -230,6 +313,7 @@ Remove() {
   [[ -n "$id" ]] || { echo "Error: remove requires <server-id>" >&2; usage >&2; exit 1; }
   require_root
   require ip systemctl
+  load_local_config
   validate_id "$id"
   load_server_config "$id"
 
@@ -246,6 +330,7 @@ Start() {
   [[ -n "$id" ]] || { echo "Error: start requires <server-id>" >&2; usage >&2; exit 1; }
   require_root
   require ip ssh systemctl
+  load_local_config
   validate_id "$id"
   load_server_config "$id"
 
@@ -292,6 +377,7 @@ Stop() {
   [[ -n "$id" ]] || { echo "Error: stop requires <server-id>" >&2; usage >&2; exit 1; }
   require_root
   require ip systemctl
+  load_local_config
   validate_id "$id"
   load_server_config "$id"
 
@@ -311,6 +397,7 @@ Stop() {
 Use() {
   require_root
   require ip
+  load_local_config
   local id="${1:-}"
 
   if [[ -z "$id" ]]; then
@@ -332,9 +419,11 @@ Use() {
 
 Status() {
   require ip ssh systemctl
+  load_local_config
 
   echo "=== Global ==="
   printf '  Script:          %s\n' "$SCRIPT_PATH"
+  printf '  Local config:     %s (%s)\n' "$LOCAL_CONFIG" "$LOCAL_CONFIG_SOURCE"
   printf '  REAL_IFACE:      %s\n' "$REAL_IFACE"
   printf '  REAL_GATEWAY:    %s\n' "$REAL_GATEWAY"
   printf '  CLIENT_TUN_IP:   %s\n' "$CLIENT_TUN_IP"
@@ -390,7 +479,9 @@ Status() {
       || printf '    Remote reachable:  no\n'
   done < <(server_ids)
 
-  (( any == 0 )) && echo "  (no servers configured in $TUN_D_DIR)"
+  if (( any == 0 )); then
+    echo "  (no servers configured in $TUN_D_DIR)"
+  fi
 }
 
 # Exposed for systemd (ExecStart of tun@<id>.service), documented
