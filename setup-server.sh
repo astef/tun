@@ -100,7 +100,10 @@ report_rule() {
 # ==================================================================
 
 setup_tun_module() {
-  modprobe tun
+  modprobe tun 2>/dev/null || true
+  if [[ ! -c /dev/net/tun ]]; then
+    die "tun driver not available: /dev/net/tun is missing"
+  fi
   echo tun > /etc/modules-load.d/tun.conf
 }
 
@@ -177,11 +180,11 @@ Status() {
   require ip iptables sysctl systemctl sshd
   detect_public_iface 2>/dev/null || true
 
-  echo "=== Kernel module ==="
-  if lsmod | grep -q '^tun '; then
-    echo "  tun: loaded"
+  echo "=== TUN driver ==="
+  if [[ -c /dev/net/tun ]]; then
+    echo "  /dev/net/tun: present"
   else
-    echo "  tun: NOT loaded"
+    echo "  /dev/net/tun: MISSING"
   fi
   printf '  /etc/modules-load.d/tun.conf: %s\n' \
     "$( [[ -f /etc/modules-load.d/tun.conf ]] && echo present || echo missing )"
