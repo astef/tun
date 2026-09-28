@@ -247,6 +247,44 @@ server_label() {
 service_installed() { systemctl cat "$(service_name "$1")" &>/dev/null; }
 service_state()     { systemctl is-active "$(service_name "$1")" 2>/dev/null || true; }
 
+# Absolute path systemd resolves for a unit's ExecStart, or "" if the
+# unit is not installed or the path can't be determined. Compared
+# against SCRIPT_PATH to detect a unit left over from an older/moved
+# checkout.
+unit_exec_path() {
+  local id="${1:-}"
+  local svc; svc="$(service_name "$id")"
+  local show path
+  show=$(systemctl show -p ExecStart "$svc" 2>/dev/null) || return 0
+  [[ "$show" == *path=* ]] || return 0
+  path="${show#*path=}"
+  path="${path%% *}"
+  printf '%s' "$path"
+}
+
+# Human-readable reason for a failed unit: the process exit status
+# plus the last error line from its journal. Tolerates permission
+# problems gracefully (falls back to just the exit status).
+service_failure_detail() {
+  local svc; svc="$(service_name "$1")"
+  local status line
+  status=$(systemctl show -p ExecMainStatus "$svc" 2>/dev/null \
+    | cut -d= -f2- || true)
+  line=$(journalctl -u "$svc" -n 100 --no-pager -o cat 2>/dev/null \
+    | grep -a -E 'Disconnecting|Failed at step|No such file|denied|timed out|unreachable|refused|reset|reset by peer' \
+    | tail -1 || true)
+
+  if [[ -n "$status" && -n "$line" ]]; then
+    printf 'exit %s: %s' "$status" "$line"
+  elif [[ -n "$line" ]]; then
+    printf '%s' "$line"
+  elif [[ -n "$status" ]]; then
+    printf 'exit %s' "$status"
+  else
+    printf 'no log detail available'
+  fi
+}
+
 tun_exists() { ip link show "$1" &>/dev/null; }
 
 exception_route_exists() {
@@ -380,6 +418,15 @@ Start() {
   local port="${SERVER[SSH_PORT]}"
   local tun_dev="tun$id"
   local svc; svc="$(service_name "$id")"
+
+  # Refuse to start from a stale unit (installed from a moved/older
+  # checkout): systemd would fail with a cryptic 203/EXEC instead.
+  local exec_path
+  if service_installed "$id"; then
+    exec_path="$(unit_exec_path "$id" || true)"
+    [[ -z "$exec_path" || "$exec_path" == "$SCRIPT_PATH" ]] || \
+      die "installed unit $svc is stale (ExecStart=$exec_path); run '$PROG install $id' first"
+  fi
 
   if [[ "$(service_state "$id")" == "active" ]]; then
     die "service $svc is already active (use stop first)"
@@ -578,9 +625,15 @@ Status() {
 
     # --- Per-server state, gathered before printing ---
     local svc_state="" installed=0 tun_up=0 exc_route=0 carries=0 reachable=0
+    local exec_path="" stale=0
     if service_installed "$id"; then
       installed=1
       svc_state="$(service_state "$id")"
+      exec_path="$(unit_exec_path "$id" || true)"
+      # Corrupted unit: installed from a different (e.g. moved) checkout.
+      if [[ -n "$exec_path" && "$exec_path" != "$SCRIPT_PATH" ]]; then
+        stale=1
+      fi
     fi
     tun_exists "$tun_dev" && tun_up=1
     exception_route_exists "$host" && exc_route=1
@@ -603,12 +656,13 @@ Status() {
 
     if (( installed )); then
       printf '    Service installed: yes\n'
+      if (( stale )); then
+        printf '    Unit:              %s\n' \
+          "$(paint red "STALE: $exec_path")  (run '$PROG install $id')"
+      fi
       if [[ "$svc_state" == "failed" ]]; then
-        local fail_res
-        fail_res=$(systemctl show -p Result "$(service_name "$id")" 2>/dev/null \
-          | cut -d= -f2- || true)
-        printf '    Service state:     %s  (systemd result: %s)\n' \
-          "$(paint red failed)" "${fail_res:-unknown}"
+        printf '    Service state:     %s  (%s)\n' \
+          "$(paint red failed)" "$(service_failure_detail "$id")"
       else
         printf '    Service state:     %s\n' "$(paint_service_state "$svc_state")"
       fi
