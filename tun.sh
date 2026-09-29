@@ -451,13 +451,15 @@ Start() {
   local tun_dev="tun$id"
   local svc; svc="$(service_name "$id")"
 
-  # Refuse to start from a stale unit (installed from a moved/older
-  # checkout): systemd would fail with a cryptic 203/EXEC instead.
+  # If the unit was installed from a moved/older checkout, update it
+  # in place. Otherwise systemd would fail with a cryptic 203/EXEC.
   local exec_path
   if service_installed "$id"; then
     exec_path="$(unit_exec_path "$id" || true)"
-    [[ -z "$exec_path" || "$exec_path" == "$SCRIPT_PATH" ]] || \
-      die "installed unit $svc is stale (ExecStart=$exec_path); run '$PROG install $id' first"
+    if [[ -n "$exec_path" && "$exec_path" != "$SCRIPT_PATH" ]]; then
+      echo "Unit $svc points to stale path $exec_path; reinstalling for $SCRIPT_PATH." >&2
+      Install "$id"
+    fi
   fi
 
   if [[ "$(service_state "$id")" == "active" ]]; then
