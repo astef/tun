@@ -358,6 +358,17 @@ require_root() {
   [[ "$EUID" -eq 0 ]] || die "must run as root (try sudo)"
 }
 
+# Defensive: `systemctl disable` already removes the .wants symlink,
+# but a partial/hand-edited state shouldn't survive `remove`.
+remove_enable_symlinks() {
+  local id="$1" svc link
+  svc="$(service_name "$id")"
+  for link in /etc/systemd/system/*.wants/"$svc"; do
+    [[ -e "$link" || -L "$link" ]] && rm -f "$link"
+  done
+  return 0
+}
+
 # ==================================================================
 # Public commands
 # ==================================================================
@@ -404,13 +415,24 @@ Remove() {
   validate_id "$id"
   load_server_config "$id"
 
-  if systemctl is-active --quiet "$(service_name "$id")" 2>/dev/null; then
-    Stop "$id"
-  fi
-  systemctl disable "$(service_name "$id")" 2>/dev/null || true
-  rm -f "$(unit_path_for "$id")"
+  # Always run the stop path. A failed unit is not "active", but may
+  # still have a tun device/exception route and a failed systemd state.
+  Stop "$id"
+
+  # Full teardown of this id's unit: drop the .wants symlink, clear
+  # any residual state, remove the unit file itself. Nothing about
+  # other ids is touched.
+  local svc; svc="$(service_name "$id")"
+  local unit_path; unit_path="$(unit_path_for "$id")"
+
+  systemctl disable "$svc" 2>/dev/null || true
+  remove_enable_symlinks "$id"
+  systemctl reset-failed "$svc" 2>/dev/null || true
+  rm -f "$unit_path"
   systemctl daemon-reload
+
   remove_exception_route "${SERVER[HOST]}"
+
   echo "Removed: $id$(server_label)"
 }
 
@@ -483,11 +505,13 @@ Stop() {
   local svc; svc="$(service_name "$id")"
 
   systemctl stop "$svc" 2>/dev/null || true
+  systemctl reset-failed "$svc" 2>/dev/null || true
 
   if default_via_tun "$tun_dev"; then
     ip route replace default via "$REAL_GATEWAY" dev "$REAL_IFACE" || true
   fi
   ip link del "$tun_dev" 2>/dev/null || true
+  remove_exception_route "${SERVER[HOST]}"
 
   echo "Stopped: $id$(server_label)"
 }
