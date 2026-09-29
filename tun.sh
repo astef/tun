@@ -9,7 +9,7 @@ SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 readonly PROG="$(basename "$0")"
 readonly TUN_D_DIR="$SCRIPT_DIR/tun.d"
 readonly LOCAL_CONFIG="$TUN_D_DIR/localhost.sh"
-readonly UNIT_PATH="/etc/systemd/system/tun@.service"
+readonly UNIT_DIR="/etc/systemd/system"
 
 # ==================================================================
 # Global network configuration
@@ -74,6 +74,9 @@ $TUN_D_DIR/<id>.sh, which declares:
     [SSH_PORT]="22"   # optional, defaults to 22
     [DESC]="RU-0"     # optional, human-readable label
   )
+
+Each id gets its own unit file $UNIT_DIR/tun-<id>.service, so ids
+are installed and removed independently.
 
 Tunnel IPs live in the global section of this script. System-specific
 values (REAL_IFACE, REAL_GATEWAY) live in $TUN_D_DIR/localhost.sh,
@@ -232,7 +235,9 @@ load_server_config() {
 # Small helpers (private)
 # ==================================================================
 
-service_name() { echo "tun@$1.service"; }
+# Each server id gets its own unit file, no systemd template involved.
+unit_path_for() { printf '%s/tun-%s.service' "$UNIT_DIR" "$1"; }
+service_name()  { printf 'tun-%s.service' "$1"; }
 
 # " (DESC)" when the loaded server declares a human-readable [DESC],
 # empty string otherwise. Used in human-facing output.
@@ -244,7 +249,8 @@ server_label() {
   return 0
 }
 
-service_installed() { systemctl cat "$(service_name "$1")" &>/dev/null; }
+# Installed == its own unit file is present on disk.
+service_installed() { [[ -f "$(unit_path_for "$1")" ]]; }
 service_state()     { systemctl is-active "$(service_name "$1")" 2>/dev/null || true; }
 
 # Absolute path systemd resolves for a unit's ExecStart, or "" if the
@@ -364,16 +370,18 @@ Install() {
   validate_id "$id"
   load_server_config "$id"
 
-  if [[ ! -f "$UNIT_PATH" ]] || ! grep -qF "ExecStart=$SCRIPT_PATH run" "$UNIT_PATH"; then
-    cat > "$UNIT_PATH" <<EOF
+  local unit_path; unit_path="$(unit_path_for "$id")"
+
+  if [[ ! -f "$unit_path" ]] || ! grep -qF "ExecStart=$SCRIPT_PATH run $id" "$unit_path"; then
+    cat > "$unit_path" <<EOF
 [Unit]
-Description=SSH TUN VPN to %i
+Description=SSH TUN VPN to $id
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$SCRIPT_PATH run %i
+ExecStart=$SCRIPT_PATH run $id
 TimeoutStopSec=10
 # No Restart=, no auto-start. Recovery is manual by design.
 
@@ -400,6 +408,8 @@ Remove() {
     Stop "$id"
   fi
   systemctl disable "$(service_name "$id")" 2>/dev/null || true
+  rm -f "$(unit_path_for "$id")"
+  systemctl daemon-reload
   remove_exception_route "${SERVER[HOST]}"
   echo "Removed: $id$(server_label)"
 }
@@ -706,7 +716,7 @@ Status() {
   fi
 }
 
-# Exposed for systemd (ExecStart of tun@<id>.service), documented
+# Exposed for systemd (ExecStart of tun-<id>.service), documented
 # under "Internal commands" in --help. Do not call directly.
 Run() {
   local id="${1:-}"
