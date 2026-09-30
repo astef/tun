@@ -8,25 +8,19 @@ SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 
 readonly PROG="$(basename "$0")"
 readonly TUN_D_DIR="$SCRIPT_DIR/tun.d"
-readonly SERVERS_DIR="$TUN_D_DIR/servers"
-readonly LOCAL_CONFIG="$TUN_D_DIR/localhost.sh"
 readonly UNIT_DIR="/etc/systemd/system"
 
 # ==================================================================
-# Global network configuration
+# Config Scripts
 # ==================================================================
 #
-# System-specific values (REAL_IFACE, REAL_GATEWAY, ...) live in
-# $LOCAL_CONFIG, not here. That file is generated on first use with
-# best-effort auto-detected values:
+# Every *.sh file in $TUN_D_DIR is a Config Script, sourced by
+# load_config() in lexicographical order on every command. Their purpose
+# is to modify this script's global variables: SERVERS, EXCEPTIONS,
+# LEAKS, REAL_IFACE, REAL_GATEWAY (see "Global state" below).
 #
-#     ip route | grep '^default'
-#     default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.42 metric 100
-#         REAL_IFACE   = token after "dev"
-#         REAL_GATEWAY = token after "via"
-#
-# These don't change mid-connection, so they're hardcoded in that file.
-# What follows here is global: sensible on any system as-is.
+# Nothing here is auto-generated: create the scripts yourself (see
+# usage() / `$PROG help` for the format).
 
 # Tunnel addresses. Shared across servers because every server gets its
 # own tun<id> interface, so they never collide.
@@ -42,16 +36,23 @@ readonly TUN_MAX_ID=255
 # Global state
 # ==================================================================
 #
-# SERVER and EXCEPTIONS are pre-declared here (assoc / indexed) so that
-# server configs, which are sourced from within load_server_config, can
-# fill them with plain assignments. A bare assignment targets the global
-# unless `declare`/`local` recreates it in a function scope — which is
-# why configs must NOT use `declare` for these (see usage()).
+# What follows is the state that Config Scripts (sourced by load_config)
+# are allowed to modify. Everything is pre-declared here so that plain
+# assignments inside those scripts target the globals (a bare assignment
+# inside a function only becomes a local when `declare`/`local` recreates
+# it, so Config Scripts must not declare these names).
+#
+#   SERVERS          assoc: SERVERS["<id>,HOST"], [<id>,USER], and the
+#                    optional [<id>,SSH_PORT] (default 22), [<id>,DESC].
+#   EXCEPTIONS       indexed: IPs that traffic may bypass the tunnel for.
+#   LEAKS            indexed: tcpdump filters for expected direct traffic.
+#   REAL_IFACE       physical interface; REAL_GATEWAY: its gateway.
 
-declare -A SERVER=()
+declare -A SERVERS=()
 declare -a EXCEPTIONS=()
-declare -a LEAKS=()
-SERVER_ID=""
+LEAKS=( "ether multicast" "igmp" "arp" )
+REAL_IFACE=""
+REAL_GATEWAY=""
 
 # ==================================================================
 # Help
@@ -75,30 +76,29 @@ Commands:
 Internal commands (invoked by systemd; not for direct use):
   run <id>        Run ssh in the foreground (unit ExecStart).
 
-Server <id> is an integer in $TUN_MIN_ID..$TUN_MAX_ID matching
-$SERVERS_DIR/<id>.sh, which declares:
+Configuration:
+  Every *.sh file in $TUN_D_DIR is a Config Script, sourced in
+  lexicographical order on each command. Config Scripts just modify
+  this script's globals. A server is registered by appending to the
+  pre-declared SERVERS associative array (compound keys; quote them).
+  Server ids are integers in $TUN_MIN_ID..$TUN_MAX_ID (the id in a
+  SERVERS["<id>,..."] key = its tun<id> device):
 
-  . "$TUN_D_DIR/exceptions.sh"   # shared list of IPs kept off the tunnel
+    # tun.d/3.sh — example server
+    SERVERS["3,HOST"]="1.2.3.4"
+    SERVERS["3,USER"]="root"
+    SERVERS["3,SSH_PORT"]="22"    # optional, defaults to 22
+    SERVERS["3,DESC"]="RU-0"      # optional, human-readable label
+    EXCEPTIONS+=( "1.2.3.4" )     # keep this server's address direct
 
-  SERVER[HOST]="1.2.3.4"
-  SERVER[USER]="root"
-  SERVER[SSH_PORT]="22"   # optional, defaults to 22
-  SERVER[DESC]="RU-0"     # optional, human-readable label
+  System-level values (e.g. in tun.d/localhost.sh):
 
-  EXCEPTIONS+=( "5.6.7.8" )   # optional extra exceptions for this server
-
-SERVER is a pre-declared associative array, so fill it with plain
-key=value assignments — do NOT redeclare it with the declare keyword
-inside the config (that would create a local copy in the loading
-function's scope). A server's own [HOST] is exempted from the tunnel
-automatically.
+    REAL_IFACE="wlp4s0"           # required
+    REAL_GATEWAY="192.168.50.1"   # required
+    LEAKS=( "ether multicast" "igmp" "arp" )   # optional, has a default
 
 Each id gets its own unit file $UNIT_DIR/tun-<id>.service, so ids
 are installed and removed independently.
-
-Tunnel IPs live in the global section of this script. System-specific
-values (REAL_IFACE, REAL_GATEWAY) live in $TUN_D_DIR/localhost.sh,
-auto-generated with best-effort detection on first use.
 
 Examples:
   $PROG install 1
@@ -113,99 +113,43 @@ EOF
 # Config plumbing (private)
 # ==================================================================
 
-# Best-effort: find a physical (non-tun) default route and print
-# "<iface> <gateway>". Empty output means detection failed.
-detect_real_route() {
-  local route dev via
+# Load configuration: source every Config Script in $TUN_D_DIR in
+# lexicographical order, then validate the result (dying on any problem)
+# and apply defaults. Config Scripts just modify the pre-declared globals
+# declared under "Global state" above. Resetting first keeps repeated
+# loads idempotent (commands nest: e.g. use -> install/start).
+load_config() {
+  local f
 
-  # Scan the routing table's default routes, skipping any that go
-  # through a tun device (i.e. this very VPN when it's up).
-  while IFS= read -r route; do
-    [[ -z "$route" ]] && continue
-    dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$route")
-    [[ -n "$dev" && "$dev" != tun* ]] || continue
-    via=$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$route")
-    printf '%s %s\n' "$dev" "$via"
-    return 0
-  done < <(ip route show default 2>/dev/null)
+  SERVERS=()
+  EXCEPTIONS=()
+  LEAKS=( "ether multicast" "igmp" "arp" )
+  REAL_IFACE=""
+  REAL_GATEWAY=""
 
-  # No usable default route: ask the kernel how it would reach the
-  # internet instead.
-  route=$(ip route get 8.8.8.8 2>/dev/null | head -1 || true)
-  [[ -z "$route" ]] && return 1
-  dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$route")
-  [[ -n "$dev" && "$dev" != tun* ]] || return 1
-  via=$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$route")
-  printf '%s %s\n' "$dev" "$via"
-  return 0
-}
-
-# Load system-specific values (REAL_IFACE, REAL_GATEWAY, ...) from
-# $LOCAL_CONFIG. When the file is missing, generate it with
-# best-effort auto-detected values. If the file cannot be written
-# (e.g. not run as root and the dir is not writable), fall back to
-# detected values in memory for this run only.
-load_local_config() {
-  LOCAL_CONFIG_SOURCE="file"
-
-  if [[ ! -f "$LOCAL_CONFIG" ]]; then
-    local line iface gateway
-    line=$(detect_real_route || true)
-    if [[ -n "$line" ]]; then
-      read -r iface gateway <<<"$line"
-    else
-      iface=""
-      gateway=""
-    fi
-
-    if {
-         cat > "$LOCAL_CONFIG" <<EOF
-# $PROG system-specific configuration (auto-generated).
-#
-# REAL_IFACE / REAL_GATEWAY: your physical interface and its gateway.
-# Find them with:
-#
-#     ip route | grep '^default'
-#
-# Example output:
-#
-#     default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.42 metric 100
-#
-# REAL_IFACE   = token after "dev"
-# REAL_GATEWAY = token after "via"
-#
-# Auto-detection is best-effort. If these values look wrong or are
-# empty, edit this file and set them manually.
-#
-# LEAKS: tcpdump filter expressions for traffic that is *expected* on the
-# physical interface even when the tunnel carries the default route, so
-# watch-leaks must not report it. Tune these to your network.
-
-REAL_IFACE="$iface"
-REAL_GATEWAY="$gateway"
-
-LEAKS=(
-  "ether multicast"
-  "igmp"
-  "arp"
-)
-EOF
-       } 2>/dev/null; then
-      LOCAL_CONFIG_SOURCE="generated"
-      echo "Note: generated $LOCAL_CONFIG with auto-detected values (review it)." >&2
-    else
-      LOCAL_CONFIG_SOURCE="auto-detected (not saved)"
-      REAL_IFACE="$iface"
-      REAL_GATEWAY="$gateway"
-      echo "Warning: cannot write $LOCAL_CONFIG; using auto-detected values for this run." >&2
-      return 0
-    fi
-  fi
-
-  . "$LOCAL_CONFIG"
+  for f in "$TUN_D_DIR"/*.sh; do
+    [[ -f "$f" ]] || continue
+    . "$f" || die "Config Script failed: $f"
+  done
 
   [[ -n "${REAL_IFACE:-}" && -n "${REAL_GATEWAY:-}" ]] || \
-    die "$LOCAL_CONFIG is incomplete: set non-empty REAL_IFACE and REAL_GATEWAY"
+    die "REAL_IFACE/REAL_GATEWAY are not set; define them in a Config Script in $TUN_D_DIR (see '$PROG help')"
+
+  # Gather and validate server ids, apply per-server defaults.
+  local key ids=() id
+  for key in "${!SERVERS[@]}"; do
+    [[ "$key" == *,HOST ]] || continue
+    ids+=( "${key%,*}" )
+  done
+  for id in "${ids[@]}"; do
+    [[ "$id" =~ ^[0-9]+$ ]] || die "server id must be an integer: '$id'"
+    (( id >= TUN_MIN_ID && id <= TUN_MAX_ID )) || \
+      die "server id out of range $TUN_MIN_ID..$TUN_MAX_ID: $id"
+    [[ -n "${SERVERS["$id,HOST"]:-}" ]] || die "server $id: HOST is not set"
+    [[ -n "${SERVERS["$id,USER"]:-}" ]] || die "server $id: USER is not set"
+    [[ -v "SERVERS[$id,SSH_PORT]" ]] || SERVERS["$id,SSH_PORT"]=22
+    [[ -v "SERVERS[$id,DESC]" ]]     || SERVERS["$id,DESC"]=""
+  done
 }
 
 validate_id() {
@@ -215,44 +159,14 @@ validate_id() {
     die "server id out of range $TUN_MIN_ID..$TUN_MAX_ID: $id"
 }
 
+# Print configured server ids (from the SERVERS registry), sorted
+# numerically. Requires load_config to have been run.
 server_ids() {
-  local f id
-  for f in "$SERVERS_DIR"/*.sh; do
-    [[ -f "$f" ]] || continue
-    id=$(basename "$f" .sh)
-    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-      echo "Warning: ignoring non-numeric config: $f" >&2
-      continue
-    fi
-    if (( id < TUN_MIN_ID || id > TUN_MAX_ID )); then
-      echo "Warning: ignoring out-of-range id $id in $f" >&2
-      continue
-    fi
-    printf '%s\n' "$id"
-  done
-}
-
-# Load $SERVERS_DIR/<id>.sh into the global SERVER map and EXCEPTIONS
-# array. The config is sourced in this shell; because SERVER and
-# EXCEPTIONS are pre-declared globals (see "Global state") and the config
-# only uses plain assignments, they land in global scope rather than in
-# this function's locals. Dies with a specific message on any problem.
-load_server_config() {
-  local id="$1"
-  local file="$SERVERS_DIR/$id.sh"
-  [[ -f "$file" ]] || die "server config not found: $file"
-
-  # Reset first so fields a config leaves unset don't leak from whatever
-  # server was loaded before.
-  SERVER=()
-  EXCEPTIONS=()
-  . "$file"
-
-  [[ -n "${SERVER[HOST]:-}" ]] || die "server config missing [HOST]: $file"
-  [[ -n "${SERVER[USER]:-}" ]] || die "server config missing [USER]: $file"
-  [[ -v "SERVER[SSH_PORT]" ]] || SERVER[SSH_PORT]=22
-  [[ -v "SERVER[DESC]" ]] || SERVER[DESC]=""
-  SERVER_ID="$id"
+  local key
+  for key in "${!SERVERS[@]}"; do
+    [[ "$key" == *,HOST ]] || continue
+    printf '%s\n' "${key%,*}"
+  done | sort -n -u
 }
 
 # ==================================================================
@@ -263,10 +177,11 @@ load_server_config() {
 unit_path_for() { printf '%s/tun-%s.service' "$UNIT_DIR" "$1"; }
 service_name()  { printf 'tun-%s.service' "$1"; }
 
-# " (DESC)" when the loaded server declares a human-readable [DESC],
-# empty string otherwise. Used in human-facing output.
+# " (DESC)" when server <id> has a human-readable DESC, empty string
+# otherwise. Used in human-facing output.
 server_label() {
-  local desc="${SERVER[DESC]:-}"
+  local id="$1"
+  local desc="${SERVERS["$id,DESC"]:-}"
   if [[ -n "$desc" ]]; then
     printf ' (%s)' "$desc"
   fi
@@ -326,15 +241,15 @@ tun_configured() {
 }
 
 # Idempotently bring tun<id> into the "configured" state: local address
-# pair, link up, and the matching address on the remote end. Assumes
-# SERVER is already loaded for this id and that "ip" and "ssh" are
-# available. Dies with a specific message on any failure.
+# pair, link up, and the matching address on the remote end. Assumes the
+# config is loaded and that "ip" and "ssh" are available. Dies with a
+# specific message on any failure.
 configure_tun() {
   local id="$1"
   local tun_dev="tun$id"
-  local host="${SERVER[HOST]}"
-  local user="${SERVER[USER]}"
-  local port="${SERVER[SSH_PORT]}"
+  local host="${SERVERS["$id,HOST"]}"
+  local user="${SERVERS["$id,USER"]}"
+  local port="${SERVERS["$id,SSH_PORT"]}"
 
   ip addr replace "$CLIENT_TUN_IP/32" peer "$SERVER_TUN_IP" dev "$tun_dev" \
     || die "cannot assign $CLIENT_TUN_IP peer $SERVER_TUN_IP on $tun_dev"
@@ -364,32 +279,34 @@ remove_exception_route() {
   ip route del "$host" via "$REAL_GATEWAY" dev "$REAL_IFACE" 2>/dev/null || true
 }
 
-# Print the effective exception list for the loaded server: its own HOST
-# (always exempted, so the tunnel's SSH transport never loops) plus every
-# configured EXCEPTIONS entry, deduplicated.
-effective_exceptions() {
+# Print the exception IPs for server <id>: its own address (so the SSH
+# transport never loops through the tunnel) plus whatever the Config
+# Scripts put into EXCEPTIONS (e.g. other servers' addresses, so traffic
+# never goes from one server to another through a tunnel), deduplicated.
+exceptions_for() {
+  local id="$1"
   local -A seen=()
   local ip
-  for ip in "${SERVER[HOST]}" "${EXCEPTIONS[@]}"; do
+  for ip in "${SERVERS["$id,HOST"]:-}" "${EXCEPTIONS[@]}"; do
     [[ -n "$ip" && -z "${seen[$ip]:-}" ]] || continue
     seen["$ip"]=1
     printf '%s\n' "$ip"
   done
 }
 
-# Apply/clear exception routes for every IP in effective_exceptions().
+# Apply/clear exception routes for the server <id>.
 ensure_exception_routes() {
-  local ip
+  local id="$1" ip
   while IFS= read -r ip; do
     ensure_exception_route "$ip"
-  done < <(effective_exceptions)
+  done < <(exceptions_for "$id")
 }
 
 remove_exception_routes() {
-  local ip
+  local id="$1" ip
   while IFS= read -r ip; do
     remove_exception_route "$ip"
-  done < <(effective_exceptions)
+  done < <(exceptions_for "$id")
 }
 
 default_via_tun() {
@@ -475,8 +392,8 @@ Install() {
   [[ -n "$id" ]] || { echo "Error: install requires <server-id>" >&2; usage >&2; exit 1; }
   require_root
   require systemctl
+  load_config
   validate_id "$id"
-  load_server_config "$id"
 
   local unit_path; unit_path="$(unit_path_for "$id")"
 
@@ -506,7 +423,7 @@ EOF
   systemctl disable "$(service_name "$id")" 2>/dev/null || true
   remove_enable_symlinks "$id"
 
-  echo "Installed: $id$(server_label) (not enabled, not started)"
+  echo "Installed: $id$(server_label "$id") (not enabled, not started)"
 }
 
 Remove() {
@@ -514,9 +431,8 @@ Remove() {
   [[ -n "$id" ]] || { echo "Error: remove requires <server-id>" >&2; usage >&2; exit 1; }
   require_root
   require ip systemctl
-  load_local_config
+  load_config
   validate_id "$id"
-  load_server_config "$id"
 
   # Always run the stop path. A failed unit is not "active", but may
   # still have a tun device/exception route and a failed systemd state.
@@ -534,9 +450,9 @@ Remove() {
   rm -f "$unit_path"
   systemctl daemon-reload
 
-  remove_exception_routes
+  remove_exception_routes "$id"
 
-  echo "Removed: $id$(server_label)"
+  echo "Removed: $id$(server_label "$id")"
 }
 
 Start() {
@@ -544,9 +460,8 @@ Start() {
   [[ -n "$id" ]] || { echo "Error: start requires <server-id>" >&2; usage >&2; exit 1; }
   require_root
   require ip ssh systemctl
-  load_local_config
+  load_config
   validate_id "$id"
-  load_server_config "$id"
 
   local tun_dev="tun$id"
   local svc; svc="$(service_name "$id")"
@@ -570,13 +485,13 @@ Start() {
     # unit was started directly by systemd, or a previous run left an
     # orphan). Finish the job instead of dying.
     echo "Service $svc is active but $tun_dev is unconfigured; configuring it now." >&2
-    ensure_exception_routes
+    ensure_exception_routes "$id"
     configure_tun "$id"
-    echo "Reconfigured: $id$(server_label)"
+    echo "Reconfigured: $id$(server_label "$id")"
     return 0
   fi
 
-  ensure_exception_routes
+  ensure_exception_routes "$id"
   systemctl start "$svc" || die "systemctl start $svc failed"
 
   local waited=0
@@ -595,7 +510,7 @@ Start() {
 
   configure_tun "$id"
 
-  echo "Started: $id$(server_label)"
+  echo "Started: $id$(server_label "$id")"
 }
 
 Stop() {
@@ -603,9 +518,8 @@ Stop() {
   [[ -n "$id" ]] || { echo "Error: stop requires <server-id>" >&2; usage >&2; exit 1; }
   require_root
   require ip systemctl
-  load_local_config
+  load_config
   validate_id "$id"
-  load_server_config "$id"
 
   local tun_dev="tun$id"
   local svc; svc="$(service_name "$id")"
@@ -617,9 +531,9 @@ Stop() {
     ip route replace default via "$REAL_GATEWAY" dev "$REAL_IFACE" || true
   fi
   ip link del "$tun_dev" 2>/dev/null || true
-  remove_exception_routes
+  remove_exception_routes "$id"
 
-  echo "Stopped: $id$(server_label)"
+  echo "Stopped: $id$(server_label "$id")"
 }
 
 Use() {
@@ -628,16 +542,15 @@ Use() {
 
   if [[ -z "$id" ]]; then
     require ip
-    load_local_config
+    load_config
     ip route replace default via "$REAL_GATEWAY" dev "$REAL_IFACE"
     echo "Default route restored via $REAL_IFACE ($REAL_GATEWAY)"
     return 0
   fi
 
   require ip ssh systemctl
-  load_local_config
+  load_config
   validate_id "$id"
-  load_server_config "$id"
 
   local tun_dev="tun$id"
 
@@ -658,19 +571,20 @@ Use() {
     configure_tun "$id"
   fi
 
-  ensure_exception_routes
+  ensure_exception_routes "$id"
   ip route replace default via "$SERVER_TUN_IP" dev "$tun_dev" \
     || die "$SERVER_TUN_IP is not reachable via $tun_dev (tunnel not ready)"
-  echo "Default route now via server $id$(server_label) ($tun_dev -> $SERVER_TUN_IP)"
+  echo "Default route now via server $id$(server_label "$id") ($tun_dev -> $SERVER_TUN_IP)"
 }
 
-# Print the tcpdump capture filter for leak-watching: everything except
-# the effective exceptions and the known leaks in $LEAKS. Emits
+# Print the tcpdump capture filter for leak-watching server <id>:
+# everything except its exceptions and the known leaks in $LEAKS. Emits
 # "not ()" when there is nothing to exclude.
 leak_filter() {
+  local id="$1"
   local -a terms=()
   local ip leak
-  while IFS= read -r ip; do terms+=("host $ip"); done < <(effective_exceptions)
+  while IFS= read -r ip; do terms+=("host $ip"); done < <(exceptions_for "$id")
   for leak in "${LEAKS[@]}"; do terms+=("$leak"); done
 
   local joined="" t
@@ -683,20 +597,19 @@ leak_filter() {
 WatchLeaks() {
   require_root
   require ip tcpdump
-  load_local_config
+  load_config
 
   # Only while a tunnel carries the default route. Which server that is
-  # determines the exception list (its own host plus its EXCEPTIONS).
+  # determines the exception set (its own host plus EXCEPTIONS).
   local id
   id="$(active_server_id)" || die "tun is not in use"
-  load_server_config "$id"
 
   local filter
-  filter="$(leak_filter)"
+  filter="$(leak_filter "$id")"
   [[ "$filter" != "not ()" ]] || \
     die "no exceptions or known leaks configured"
 
-  echo "Watching for leaks on $REAL_IFACE (default via tun$id, server $id$(server_label))" >&2
+  echo "Watching for leaks on $REAL_IFACE (default via tun$id, server $id$(server_label "$id"))" >&2
   echo "Filter: $filter" >&2
   exec tcpdump -i "$REAL_IFACE" -n -nn "$filter"
 }
@@ -746,16 +659,13 @@ paint_service_state() {
 
 Status() {
   require ip ssh systemctl
-  load_local_config
+  load_config
 
   # --- Global state, gathered once up front ---
-  local lo_color=""
-  case "$LOCAL_CONFIG_SOURCE" in
-    file)                          lo_color=green ;;
-    generated)                     lo_color=yellow ;;
-    auto-detected\ \(not\ saved\)) lo_color=red ;;
-    *)                             lo_color="" ;;
-  esac
+  local n_scripts=0 f
+  for f in "$TUN_D_DIR"/*.sh; do
+    [[ -f "$f" ]] && n_scripts=$((n_scripts + 1))
+  done
 
   local iface_ok=0
   tun_exists "$REAL_IFACE" && iface_ok=1
@@ -769,8 +679,7 @@ Status() {
   # --- Print ---
   echo "=== Global ==="
   printf '  Script:          %s\n' "$SCRIPT_PATH"
-  printf '  Local config:     %s (%s)\n' \
-    "$LOCAL_CONFIG" "$(paint "$lo_color" "$LOCAL_CONFIG_SOURCE")"
+  printf '  Config Scripts:   %s (%d sourced)\n' "$TUN_D_DIR" "$n_scripts"
   if (( iface_ok )); then
     printf '  REAL_IFACE:      %s\n' "$REAL_IFACE"
   else
@@ -795,29 +704,11 @@ Status() {
   while IFS= read -r id; do
     any=1
 
-    # Probe validity in a subshell so a broken config doesn't abort
-    # the whole report. Its stderr becomes the error detail.
-    local cfg_err=""
-    if cfg_err="$( ( load_server_config "$id" ) 2>&1 >/dev/null )"; then
-      cfg_err=""
-      load_server_config "$id"
-    else
-      local err_line="${cfg_err%%$'\n'*}"
-      err_line="${err_line#Error: }"
-      printf '  [%s]\n' "$id"
-      if [[ -n "$err_line" ]]; then
-        printf '    Config:            %s  (%s)\n' "$(paint red INVALID)" "$err_line"
-      else
-        printf '    Config:            %s\n' "$(paint red INVALID)"
-      fi
-      continue
-    fi
-
     local tun_dev="tun$id"
-    local host="${SERVER[HOST]}"
-    local user="${SERVER[USER]}"
-    local port="${SERVER[SSH_PORT]}"
-    local desc="${SERVER[DESC]:-}"
+    local host="${SERVERS["$id,HOST"]}"
+    local user="${SERVERS["$id,USER"]}"
+    local port="${SERVERS["$id,SSH_PORT"]}"
+    local desc="${SERVERS["$id,DESC"]}"
 
     # --- Per-server state, gathered before printing ---
     local svc_state="" installed=0 tun_up=0 tun_cfg=0 carries=0 reachable=0
@@ -837,7 +728,7 @@ Status() {
     while IFS= read -r ip; do
       exc_total=$((exc_total+1))
       exception_route_exists "$ip" && exc_ok=$((exc_ok+1))
-    done < <(effective_exceptions)
+    done < <(exceptions_for "$id")
     default_via_tun "$tun_dev" && carries=1
     remote_reachable "$host" "$port" "$user" && reachable=1
 
@@ -914,7 +805,7 @@ Status() {
   done < <(server_ids)
 
   if (( any == 0 )); then
-    echo "  (no servers configured in $SERVERS_DIR)"
+    echo "  (no servers configured in $TUN_D_DIR)"
   fi
 }
 
@@ -923,16 +814,16 @@ Status() {
 Run() {
   local id="${1:-}"
   [[ -n "$id" ]] || { echo "Error: run requires <server-id>" >&2; usage >&2; exit 1; }
+  load_config
   validate_id "$id"
-  load_server_config "$id"
 
   exec ssh -N -w "$id:$id" \
       -o Tunnel=point-to-point \
       -o ExitOnForwardFailure=yes \
       -o ServerAliveInterval=30 \
       -o ServerAliveCountMax=3 \
-      -p "${SERVER[SSH_PORT]}" \
-      "${SERVER[USER]}@${SERVER[HOST]}"
+      -p "${SERVERS["$id,SSH_PORT"]}" \
+      "${SERVERS["$id,USER"]}@${SERVERS["$id,HOST"]}"
 }
 
 # ==================================================================
