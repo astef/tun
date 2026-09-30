@@ -8,7 +8,9 @@ SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 
 readonly PROG="$(basename "$0")"
 readonly TUN_D_DIR="$SCRIPT_DIR/tun.d"
+readonly SERVERS_DIR="$TUN_D_DIR/servers"
 readonly LOCAL_CONFIG="$TUN_D_DIR/localhost.sh"
+readonly EXCEPTIONS_CONFIG="$TUN_D_DIR/exceptions.sh"
 readonly UNIT_DIR="/etc/systemd/system"
 
 # ==================================================================
@@ -66,7 +68,9 @@ Internal commands (invoked by systemd; not for direct use):
   run <id>        Run ssh in the foreground (unit ExecStart).
 
 Server <id> is an integer in $TUN_MIN_ID..$TUN_MAX_ID matching
-$TUN_D_DIR/<id>.sh, which declares:
+$SERVERS_DIR/<id>.sh, which declares:
+
+  . "$TUN_D_DIR/exceptions.sh"     # catalogue of banned-through-tunnel IPs
 
   declare -A SERVER=(
     [HOST]="1.2.3.4"
@@ -74,6 +78,8 @@ $TUN_D_DIR/<id>.sh, which declares:
     [SSH_PORT]="22"   # optional, defaults to 22
     [DESC]="RU-0"     # optional, human-readable label
   )
+
+  EXCEPTIONS=( ... )  # which IPs bypass the tunnel (min. [HOST])
 
 Each id gets its own unit file $UNIT_DIR/tun-<id>.service, so ids
 are installed and removed independently.
@@ -189,10 +195,9 @@ validate_id() {
 
 server_ids() {
   local f id
-  for f in "$TUN_D_DIR"/*.sh; do
+  for f in "$SERVERS_DIR"/*.sh; do
     [[ -f "$f" ]] || continue
     id=$(basename "$f" .sh)
-    [[ "$id" == "localhost" ]] && continue
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then
       echo "Warning: ignoring non-numeric config: $f" >&2
       continue
@@ -205,24 +210,31 @@ server_ids() {
   done
 }
 
-# Load $TUN_D_DIR/<id>.sh into the global SERVER map. The file is
-# executed in a subshell so nothing it does leaks into this shell,
-# then only the SERVER declaration is imported. Dies with a specific
-# message on any problem.
+# Load $SERVERS_DIR/<id>.sh into the global SERVER map and EXCEPTIONS
+# array. The file is executed in a subshell so nothing it does leaks into
+# this shell, then only the SERVER / EXCEPTIONS declarations are
+# imported. Dies with a specific message on any problem.
 load_server_config() {
   local id="$1"
-  local file="$TUN_D_DIR/$id.sh"
+  local file="$SERVERS_DIR/$id.sh"
   [[ -f "$file" ]] || die "server config not found: $file"
 
   local dump
-  dump=$( ( . "$file" 2>/dev/null; declare -p SERVER 2>/dev/null ) ) || \
-    die "server config did not define SERVER: $file"
+  dump=$( ( . "$file" 2>/dev/null
+            declare -p SERVER 2>/dev/null
+            declare -p EXCEPTIONS 2>/dev/null ) 2>/dev/null ) || \
+    die "server config must define SERVER and EXCEPTIONS (source $EXCEPTIONS_CONFIG): $file"
 
-  [[ "$dump" == declare\ -A\ SERVER=* ]] || \
+  [[ "$dump" == *declare\ -A\ SERVER=* ]] || \
     die "server config must define associative array SERVER: $file"
 
-  unset SERVER
-  eval "${dump/#declare -A /declare -g -A }"
+  # Make the declarations target the global scope: this function's locals
+  # would otherwise shadow the globals we're filling in.
+  dump="${dump//declare -A /declare -g -A }"
+  dump="${dump//declare -a /declare -g -a }"
+
+  unset SERVER EXCEPTIONS
+  eval "$dump"
 
   [[ -n "${SERVER[HOST]:-}" ]] || die "server config missing [HOST]: $file"
   [[ -n "${SERVER[USER]:-}" ]] || die "server config missing [USER]: $file"
@@ -307,6 +319,23 @@ ensure_exception_route() {
 remove_exception_route() {
   local host="$1"
   ip route del "$host" via "$REAL_GATEWAY" dev "$REAL_IFACE" 2>/dev/null || true
+}
+
+# Apply/clear exception routes for every IP in the current EXCEPTIONS
+# array (populated by load_server_config). Each server decides its own
+# list by sourcing $EXCEPTIONS_CONFIG and overriding EXCEPTIONS.
+ensure_exception_routes() {
+  local ip
+  for ip in "${EXCEPTIONS[@]:-}"; do
+    ensure_exception_route "$ip"
+  done
+}
+
+remove_exception_routes() {
+  local ip
+  for ip in "${EXCEPTIONS[@]:-}"; do
+    remove_exception_route "$ip"
+  done
 }
 
 default_via_tun() {
@@ -431,7 +460,7 @@ Remove() {
   rm -f "$unit_path"
   systemctl daemon-reload
 
-  remove_exception_route "${SERVER[HOST]}"
+  remove_exception_routes
 
   echo "Removed: $id$(server_label)"
 }
@@ -466,7 +495,7 @@ Start() {
     die "service $svc is already active (use stop first)"
   fi
 
-  ensure_exception_route "$host"
+  ensure_exception_routes
   systemctl start "$svc" || die "systemctl start $svc failed"
 
   local waited=0
@@ -513,7 +542,7 @@ Stop() {
     ip route replace default via "$REAL_GATEWAY" dev "$REAL_IFACE" || true
   fi
   ip link del "$tun_dev" 2>/dev/null || true
-  remove_exception_route "${SERVER[HOST]}"
+  remove_exception_routes
 
   echo "Stopped: $id$(server_label)"
 }
@@ -551,7 +580,7 @@ Use() {
     Start "$id"
   fi
 
-  ensure_exception_route "${SERVER[HOST]}"
+  ensure_exception_routes
   ip route replace default via "$SERVER_TUN_IP" dev "$tun_dev"
   echo "Default route now via server $id$(server_label) ($tun_dev -> $SERVER_TUN_IP)"
 }
@@ -675,7 +704,8 @@ Status() {
     local desc="${SERVER[DESC]:-}"
 
     # --- Per-server state, gathered before printing ---
-    local svc_state="" installed=0 tun_up=0 exc_route=0 carries=0 reachable=0
+    local svc_state="" installed=0 tun_up=0 carries=0 reachable=0
+    local exc_ok=0 exc_total=0 ip
     local exec_path="" stale=0
     if service_installed "$id"; then
       installed=1
@@ -687,7 +717,10 @@ Status() {
       fi
     fi
     tun_exists "$tun_dev" && tun_up=1
-    exception_route_exists "$host" && exc_route=1
+    for ip in "${EXCEPTIONS[@]:-}"; do
+      exc_total=$((exc_total+1))
+      exception_route_exists "$ip" && exc_ok=$((exc_ok+1))
+    done
     default_via_tun "$tun_dev" && carries=1
     remote_reachable "$host" "$port" "$user" && reachable=1
 
@@ -729,12 +762,14 @@ Status() {
       printf '    Tun up:            no\n'
     fi
 
-    if (( exc_route )); then
-      printf '    Exception route:   %s\n' "$(paint green yes)"
+    if (( exc_total == 0 )); then
+      printf '    Exception routes:  %s\n' "$(paint yellow none)"
+    elif (( exc_ok == exc_total )); then
+      printf '    Exception routes:  %s\n' "$(paint green "$exc_ok/$exc_total")"
     elif (( tun_up || running )); then
-      printf '    Exception route:   %s  (none for %s)\n' "$(paint red no)" "$host"
+      printf '    Exception routes:  %s\n' "$(paint red "$exc_ok/$exc_total")"
     else
-      printf '    Exception route:   no\n'
+      printf '    Exception routes:  %s\n' "$exc_ok/$exc_total"
     fi
 
     if (( carries )); then
@@ -753,7 +788,7 @@ Status() {
   done < <(server_ids)
 
   if (( any == 0 )); then
-    echo "  (no servers configured in $TUN_D_DIR)"
+    echo "  (no servers configured in $SERVERS_DIR)"
   fi
 }
 
