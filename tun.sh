@@ -57,7 +57,7 @@ Commands:
   remove  <id>    Stop, disable and clean up <id>.
   start   <id>    Bring up the tunnel: ssh, IPs, exception route.
   stop    <id>    Tear down the tunnel and clean up.
-  use     <id>    Route the default route via <id>.
+  use     <id>    Install and/or start <id> as needed, then route via it.
   use             Restore the real (non-tun) default route.
   status          Show current state of everything (default).
   help            Show this help.
@@ -520,21 +520,36 @@ Stop() {
 
 Use() {
   require_root
-  require ip
-  load_local_config
   local id="${1:-}"
 
   if [[ -z "$id" ]]; then
+    require ip
+    load_local_config
     ip route replace default via "$REAL_GATEWAY" dev "$REAL_IFACE"
     echo "Default route restored via $REAL_IFACE ($REAL_GATEWAY)"
     return 0
   fi
 
+  require ip ssh systemctl
+  load_local_config
   validate_id "$id"
   load_server_config "$id"
 
   local tun_dev="tun$id"
-  tun_exists "$tun_dev" || die "tunnel $id is not up ($tun_dev missing)"
+
+  # Auto-provision: install the unit if it's missing, then make sure the
+  # service is actually running. We never roll anything back here — if
+  # either step fails, the error propagates and the previous default
+  # route (if any) is left untouched.
+  if ! service_installed "$id"; then
+    echo "Server $id is not installed; installing it now." >&2
+    Install "$id"
+  fi
+
+  if [[ "$(service_state "$id")" != "active" ]]; then
+    echo "Service $(service_name "$id") is not running; starting it now." >&2
+    Start "$id"
+  fi
 
   ensure_exception_route "${SERVER[HOST]}"
   ip route replace default via "$SERVER_TUN_IP" dev "$tun_dev"
