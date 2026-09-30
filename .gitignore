@@ -1,3 +1,5 @@
 *.d/
 
 logs/
+
+tasks/
