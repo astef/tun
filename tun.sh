@@ -62,7 +62,7 @@ usage() {
 Usage: $PROG <command> [<server-id>]
 
 Commands:
-  install <id>    Install systemd unit for <id> (enable only).
+  install <id>    Install systemd unit for <id> (not enabled, not started).
   remove  <id>    Stop, disable and clean up <id>.
   start   <id>    Bring up the tunnel: ssh, IPs, exception route.
   stop    <id>    Tear down the tunnel and clean up.
@@ -317,6 +317,37 @@ service_failure_detail() {
 
 tun_exists() { ip link show "$1" &>/dev/null; }
 
+# True if tun<id> currently carries the expected point-to-point peer
+# address. Used to distinguish "ssh is up and the interface was
+# configured" from "ssh is up but the interface is bare".
+tun_configured() {
+  local id="$1"
+  ip -o addr show dev "tun$id" 2>/dev/null | grep -q "peer $SERVER_TUN_IP"
+}
+
+# Idempotently bring tun<id> into the "configured" state: local address
+# pair, link up, and the matching address on the remote end. Assumes
+# SERVER is already loaded for this id and that "ip" and "ssh" are
+# available. Dies with a specific message on any failure.
+configure_tun() {
+  local id="$1"
+  local tun_dev="tun$id"
+  local host="${SERVER[HOST]}"
+  local user="${SERVER[USER]}"
+  local port="${SERVER[SSH_PORT]}"
+
+  ip addr replace "$CLIENT_TUN_IP/32" peer "$SERVER_TUN_IP" dev "$tun_dev" \
+    || die "cannot assign $CLIENT_TUN_IP peer $SERVER_TUN_IP on $tun_dev"
+  ip link set "$tun_dev" up \
+    || die "cannot bring $tun_dev up"
+
+  ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=5 \
+      "${user}@${host}" \
+      "ip addr replace $SERVER_TUN_IP/32 peer $CLIENT_TUN_IP dev $tun_dev; \
+       ip link set $tun_dev up" \
+    || die "cannot configure remote end of $tun_dev on ${user}@${host}"
+}
+
 exception_route_exists() {
   local host="$1"
   ip route show "$host" 2>/dev/null | grep -q ' via '
@@ -424,7 +455,8 @@ require_root() {
 }
 
 # Defensive: `systemctl disable` already removes the .wants symlink,
-# but a partial/hand-edited state shouldn't survive `remove`.
+# but a partial/hand-edited state shouldn't survive `remove` (or an
+# install by a script version that used to enable the unit).
 remove_enable_symlinks() {
   local id="$1" svc link
   svc="$(service_name "$id")"
@@ -467,8 +499,14 @@ EOF
     systemctl daemon-reload
   fi
 
-  systemctl enable "$(service_name "$id")"
-  echo "Installed: $id$(server_label) (enabled, not started)"
+  # Deliberately NOT enabling. This script's contract is "no autostart";
+  # a tunnel only comes up when you run `tun start <id>` or `tun use <id>`.
+  # Disable + strip any .wants symlink so upgrades from a version that
+  # used to call `systemctl enable` converge to the current contract.
+  systemctl disable "$(service_name "$id")" 2>/dev/null || true
+  remove_enable_symlinks "$id"
+
+  echo "Installed: $id$(server_label) (not enabled, not started)"
 }
 
 Remove() {
@@ -510,9 +548,6 @@ Start() {
   validate_id "$id"
   load_server_config "$id"
 
-  local host="${SERVER[HOST]}"
-  local user="${SERVER[USER]}"
-  local port="${SERVER[SSH_PORT]}"
   local tun_dev="tun$id"
   local svc; svc="$(service_name "$id")"
 
@@ -528,7 +563,17 @@ Start() {
   fi
 
   if [[ "$(service_state "$id")" == "active" ]]; then
-    die "service $svc is already active (use stop first)"
+    if tun_configured "$id"; then
+      die "service $svc is already active and $tun_dev is configured (use stop first)"
+    fi
+    # ssh is running but the interface was never configured (e.g. the
+    # unit was started directly by systemd, or a previous run left an
+    # orphan). Finish the job instead of dying.
+    echo "Service $svc is active but $tun_dev is unconfigured; configuring it now." >&2
+    ensure_exception_routes
+    configure_tun "$id"
+    echo "Reconfigured: $id$(server_label)"
+    return 0
   fi
 
   ensure_exception_routes
@@ -548,13 +593,7 @@ Start() {
     fi
   done
 
-  ip addr replace "$CLIENT_TUN_IP/32" peer "$SERVER_TUN_IP" dev "$tun_dev"
-  ip link set "$tun_dev" up
-
-  ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=5 \
-      "${user}@${host}" \
-      "ip addr replace $SERVER_TUN_IP/32 peer $CLIENT_TUN_IP dev $tun_dev; \
-       ip link set $tun_dev up"
+  configure_tun "$id"
 
   echo "Started: $id$(server_label)"
 }
@@ -603,9 +642,9 @@ Use() {
   local tun_dev="tun$id"
 
   # Auto-provision: install the unit if it's missing, then make sure the
-  # service is actually running. We never roll anything back here — if
-  # either step fails, the error propagates and the previous default
-  # route (if any) is left untouched.
+  # service is actually running *and* the interface is configured. We
+  # never roll anything back here — if either step fails, the error
+  # propagates and the previous default route (if any) is left untouched.
   if ! service_installed "$id"; then
     echo "Server $id is not installed; installing it now." >&2
     Install "$id"
@@ -614,10 +653,14 @@ Use() {
   if [[ "$(service_state "$id")" != "active" ]]; then
     echo "Service $(service_name "$id") is not running; starting it now." >&2
     Start "$id"
+  elif ! tun_configured "$id"; then
+    echo "Service $(service_name "$id") is up but $tun_dev is unconfigured; configuring it now." >&2
+    configure_tun "$id"
   fi
 
   ensure_exception_routes
-  ip route replace default via "$SERVER_TUN_IP" dev "$tun_dev"
+  ip route replace default via "$SERVER_TUN_IP" dev "$tun_dev" \
+    || die "$SERVER_TUN_IP is not reachable via $tun_dev (tunnel not ready)"
   echo "Default route now via server $id$(server_label) ($tun_dev -> $SERVER_TUN_IP)"
 }
 
@@ -777,7 +820,7 @@ Status() {
     local desc="${SERVER[DESC]:-}"
 
     # --- Per-server state, gathered before printing ---
-    local svc_state="" installed=0 tun_up=0 carries=0 reachable=0
+    local svc_state="" installed=0 tun_up=0 tun_cfg=0 carries=0 reachable=0
     local exc_ok=0 exc_total=0 ip
     local exec_path="" stale=0
     if service_installed "$id"; then
@@ -790,6 +833,7 @@ Status() {
       fi
     fi
     tun_exists "$tun_dev" && tun_up=1
+    tun_configured "$id" && tun_cfg=1
     while IFS= read -r ip; do
       exc_total=$((exc_total+1))
       exception_route_exists "$ip" && exc_ok=$((exc_ok+1))
@@ -833,6 +877,15 @@ Status() {
       printf '    Tun up:            %s  (%s missing)\n' "$(paint red no)" "$tun_dev"
     else
       printf '    Tun up:            no\n'
+    fi
+
+    if (( tun_cfg )); then
+      printf '    Tun configured:    %s\n' "$(paint green yes)"
+    elif (( tun_up && running )); then
+      printf '    Tun configured:    %s  (peer %s missing)\n' \
+        "$(paint red no)" "$SERVER_TUN_IP"
+    else
+      printf '    Tun configured:    no\n'
     fi
 
     if (( exc_total == 0 )); then
