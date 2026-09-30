@@ -10,7 +10,6 @@ readonly PROG="$(basename "$0")"
 readonly TUN_D_DIR="$SCRIPT_DIR/tun.d"
 readonly SERVERS_DIR="$TUN_D_DIR/servers"
 readonly LOCAL_CONFIG="$TUN_D_DIR/localhost.sh"
-readonly EXCEPTIONS_CONFIG="$TUN_D_DIR/exceptions.sh"
 readonly UNIT_DIR="/etc/systemd/system"
 
 # ==================================================================
@@ -42,8 +41,16 @@ readonly TUN_MAX_ID=255
 # ==================================================================
 # Global state
 # ==================================================================
+#
+# SERVER and EXCEPTIONS are pre-declared here (assoc / indexed) so that
+# server configs, which are sourced from within load_server_config, can
+# fill them with plain assignments. A bare assignment targets the global
+# unless `declare`/`local` recreates it in a function scope — which is
+# why configs must NOT use `declare` for these (see usage()).
 
 declare -A SERVER=()
+declare -a EXCEPTIONS=()
+declare -a LEAKS=()
 SERVER_ID=""
 
 # ==================================================================
@@ -71,16 +78,20 @@ Internal commands (invoked by systemd; not for direct use):
 Server <id> is an integer in $TUN_MIN_ID..$TUN_MAX_ID matching
 $SERVERS_DIR/<id>.sh, which declares:
 
-  . "$TUN_D_DIR/exceptions.sh"     # catalogue of banned-through-tunnel IPs
+  . "$TUN_D_DIR/exceptions.sh"   # shared list of IPs kept off the tunnel
 
-  declare -A SERVER=(
-    [HOST]="1.2.3.4"
-    [USER]="root"
-    [SSH_PORT]="22"   # optional, defaults to 22
-    [DESC]="RU-0"     # optional, human-readable label
-  )
+  SERVER[HOST]="1.2.3.4"
+  SERVER[USER]="root"
+  SERVER[SSH_PORT]="22"   # optional, defaults to 22
+  SERVER[DESC]="RU-0"     # optional, human-readable label
 
-  EXCEPTIONS=( ... )  # which IPs bypass the tunnel (min. [HOST])
+  EXCEPTIONS+=( "5.6.7.8" )   # optional extra exceptions for this server
+
+SERVER is a pre-declared associative array, so fill it with plain
+key=value assignments — do NOT redeclare it with the declare keyword
+inside the config (that would create a local copy in the loading
+function's scope). A server's own [HOST] is exempted from the tunnel
+automatically.
 
 Each id gets its own unit file $UNIT_DIR/tun-<id>.service, so ids
 are installed and removed independently.
@@ -168,7 +179,7 @@ load_local_config() {
 #
 # LEAKS: tcpdump filter expressions for traffic that is *expected* on the
 # physical interface even when the tunnel carries the default route, so
-# `watch-leaks` must not report it. Tune these to your network.
+# watch-leaks must not report it. Tune these to your network.
 
 REAL_IFACE="$iface"
 REAL_GATEWAY="$gateway"
@@ -195,9 +206,6 @@ EOF
 
   [[ -n "${REAL_IFACE:-}" && -n "${REAL_GATEWAY:-}" ]] || \
     die "$LOCAL_CONFIG is incomplete: set non-empty REAL_IFACE and REAL_GATEWAY"
-
-  # LEAKS is optional; default to none.
-  [[ -v LEAKS ]] || LEAKS=()
 }
 
 validate_id() {
@@ -225,30 +233,20 @@ server_ids() {
 }
 
 # Load $SERVERS_DIR/<id>.sh into the global SERVER map and EXCEPTIONS
-# array. The file is executed in a subshell so nothing it does leaks into
-# this shell, then only the SERVER / EXCEPTIONS declarations are
-# imported. Dies with a specific message on any problem.
+# array. The config is sourced in this shell; because SERVER and
+# EXCEPTIONS are pre-declared globals (see "Global state") and the config
+# only uses plain assignments, they land in global scope rather than in
+# this function's locals. Dies with a specific message on any problem.
 load_server_config() {
   local id="$1"
   local file="$SERVERS_DIR/$id.sh"
   [[ -f "$file" ]] || die "server config not found: $file"
 
-  local dump
-  dump=$( ( . "$file" 2>/dev/null
-            declare -p SERVER 2>/dev/null
-            declare -p EXCEPTIONS 2>/dev/null ) 2>/dev/null ) || \
-    die "server config must define SERVER and EXCEPTIONS (source $EXCEPTIONS_CONFIG): $file"
-
-  [[ "$dump" == *declare\ -A\ SERVER=* ]] || \
-    die "server config must define associative array SERVER: $file"
-
-  # Make the declarations target the global scope: this function's locals
-  # would otherwise shadow the globals we're filling in.
-  dump="${dump//declare -A /declare -g -A }"
-  dump="${dump//declare -a /declare -g -a }"
-
-  unset SERVER EXCEPTIONS
-  eval "$dump"
+  # Reset first so fields a config leaves unset don't leak from whatever
+  # server was loaded before.
+  SERVER=()
+  EXCEPTIONS=()
+  . "$file"
 
   [[ -n "${SERVER[HOST]:-}" ]] || die "server config missing [HOST]: $file"
   [[ -n "${SERVER[USER]:-}" ]] || die "server config missing [USER]: $file"
@@ -335,21 +333,32 @@ remove_exception_route() {
   ip route del "$host" via "$REAL_GATEWAY" dev "$REAL_IFACE" 2>/dev/null || true
 }
 
-# Apply/clear exception routes for every IP in the current EXCEPTIONS
-# array (populated by load_server_config). Each server decides its own
-# list by sourcing $EXCEPTIONS_CONFIG and overriding EXCEPTIONS.
+# Print the effective exception list for the loaded server: its own HOST
+# (always exempted, so the tunnel's SSH transport never loops) plus every
+# configured EXCEPTIONS entry, deduplicated.
+effective_exceptions() {
+  local -A seen=()
+  local ip
+  for ip in "${SERVER[HOST]}" "${EXCEPTIONS[@]}"; do
+    [[ -n "$ip" && -z "${seen[$ip]:-}" ]] || continue
+    seen["$ip"]=1
+    printf '%s\n' "$ip"
+  done
+}
+
+# Apply/clear exception routes for every IP in effective_exceptions().
 ensure_exception_routes() {
   local ip
-  for ip in "${EXCEPTIONS[@]:-}"; do
+  while IFS= read -r ip; do
     ensure_exception_route "$ip"
-  done
+  done < <(effective_exceptions)
 }
 
 remove_exception_routes() {
   local ip
-  for ip in "${EXCEPTIONS[@]:-}"; do
+  while IFS= read -r ip; do
     remove_exception_route "$ip"
-  done
+  done < <(effective_exceptions)
 }
 
 default_via_tun() {
@@ -358,6 +367,19 @@ default_via_tun() {
   [[ -z "$line" ]] && return 1
   dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<<"$line")
   [[ "$dev" == "$tun_dev" ]]
+}
+
+# Print the id of the server whose tunnel currently carries the default
+# route, or nothing (exit status 1) if none does.
+active_server_id() {
+  local id
+  while IFS= read -r id; do
+    if default_via_tun "tun$id"; then
+      printf '%s\n' "$id"
+      return 0
+    fi
+  done < <(server_ids)
+  return 1
 }
 
 ssh_fail_reason() {
@@ -599,42 +621,39 @@ Use() {
   echo "Default route now via server $id$(server_label) ($tun_dev -> $SERVER_TUN_IP)"
 }
 
-WatchLeaks() {
-  require_root
-  require ip tcpdump
-  load_local_config
-
-  # Only meaningful while the default route goes through a tunnel.
-  local def_line def_dev
-  def_line=$(ip route show default 2>/dev/null | head -1 || true)
-  [[ -n "$def_line" ]] || die "tun is not in use (no default route)"
-  def_dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$def_line")
-  [[ "$def_dev" == tun* ]] || \
-    die "tun is not in use (default route goes via '$def_dev', not a tunnel)"
-
-  # The tunnel device name encodes the server id; that server's config
-  # supplies the exception list legitimately flowing over the real iface.
-  local id="${def_dev#tun}"
-  validate_id "$id"
-  load_server_config "$id"
-
-  # Build the capture filter: everything except the configured exceptions
-  # and the known leaks declared in $LOCAL_CONFIG.
+# Print the tcpdump capture filter for leak-watching: everything except
+# the effective exceptions and the known leaks in $LEAKS. Emits
+# "not ()" when there is nothing to exclude.
+leak_filter() {
   local -a terms=()
   local ip leak
-  for ip in "${EXCEPTIONS[@]:-}"; do terms+=("host $ip"); done
-  for leak in "${LEAKS[@]:-}"; do terms+=("$leak"); done
-  (( ${#terms[@]} > 0 )) || \
-    die "nothing to exclude: EXCEPTIONS and LEAKS are both empty"
+  while IFS= read -r ip; do terms+=("host $ip"); done < <(effective_exceptions)
+  for leak in "${LEAKS[@]}"; do terms+=("$leak"); done
 
   local joined="" t
   for t in "${terms[@]}"; do
     if [[ -z "$joined" ]]; then joined="$t"; else joined="$joined or $t"; fi
   done
+  printf 'not (%s)' "$joined"
+}
 
-  local filter="not ($joined)"
+WatchLeaks() {
+  require_root
+  require ip tcpdump
+  load_local_config
 
-  echo "Watching for leaks on $REAL_IFACE (default via $def_dev, server $id$(server_label))" >&2
+  # Only while a tunnel carries the default route. Which server that is
+  # determines the exception list (its own host plus its EXCEPTIONS).
+  local id
+  id="$(active_server_id)" || die "tun is not in use"
+  load_server_config "$id"
+
+  local filter
+  filter="$(leak_filter)"
+  [[ "$filter" != "not ()" ]] || \
+    die "no exceptions or known leaks configured"
+
+  echo "Watching for leaks on $REAL_IFACE (default via tun$id, server $id$(server_label))" >&2
   echo "Filter: $filter" >&2
   exec tcpdump -i "$REAL_IFACE" -n -nn "$filter"
 }
@@ -771,10 +790,10 @@ Status() {
       fi
     fi
     tun_exists "$tun_dev" && tun_up=1
-    for ip in "${EXCEPTIONS[@]:-}"; do
+    while IFS= read -r ip; do
       exc_total=$((exc_total+1))
       exception_route_exists "$ip" && exc_ok=$((exc_ok+1))
-    done
+    done < <(effective_exceptions)
     default_via_tun "$tun_dev" && carries=1
     remote_reachable "$host" "$port" "$user" && reachable=1
 
@@ -894,4 +913,8 @@ main() {
   esac
 }
 
-main "$@"
+# Only dispatch when executed as a script (not when sourced, e.g. by the
+# test harness).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
