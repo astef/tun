@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tun.sh - multi-server SSH TUN VPN manager.
-# Commands: install | remove | start | stop | use | status | help
+# Commands: install | remove | start | stop | use | status | watch-leaks | help
 
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
@@ -62,6 +62,7 @@ Commands:
   use     <id>    Install and/or start <id> as needed, then route via it.
   use             Restore the real (non-tun) default route.
   status          Show current state of everything (default).
+  watch-leaks     Show traffic leaking around the tunnel (tun must be in use).
   help            Show this help.
 
 Internal commands (invoked by systemd; not for direct use):
@@ -164,9 +165,19 @@ load_local_config() {
 #
 # Auto-detection is best-effort. If these values look wrong or are
 # empty, edit this file and set them manually.
+#
+# LEAKS: tcpdump filter expressions for traffic that is *expected* on the
+# physical interface even when the tunnel carries the default route, so
+# `watch-leaks` must not report it. Tune these to your network.
 
 REAL_IFACE="$iface"
 REAL_GATEWAY="$gateway"
+
+LEAKS=(
+  "ether multicast"
+  "igmp"
+  "arp"
+)
 EOF
        } 2>/dev/null; then
       LOCAL_CONFIG_SOURCE="generated"
@@ -184,6 +195,9 @@ EOF
 
   [[ -n "${REAL_IFACE:-}" && -n "${REAL_GATEWAY:-}" ]] || \
     die "$LOCAL_CONFIG is incomplete: set non-empty REAL_IFACE and REAL_GATEWAY"
+
+  # LEAKS is optional; default to none.
+  [[ -v LEAKS ]] || LEAKS=()
 }
 
 validate_id() {
@@ -585,6 +599,46 @@ Use() {
   echo "Default route now via server $id$(server_label) ($tun_dev -> $SERVER_TUN_IP)"
 }
 
+WatchLeaks() {
+  require_root
+  require ip tcpdump
+  load_local_config
+
+  # Only meaningful while the default route goes through a tunnel.
+  local def_line def_dev
+  def_line=$(ip route show default 2>/dev/null | head -1 || true)
+  [[ -n "$def_line" ]] || die "tun is not in use (no default route)"
+  def_dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$def_line")
+  [[ "$def_dev" == tun* ]] || \
+    die "tun is not in use (default route goes via '$def_dev', not a tunnel)"
+
+  # The tunnel device name encodes the server id; that server's config
+  # supplies the exception list legitimately flowing over the real iface.
+  local id="${def_dev#tun}"
+  validate_id "$id"
+  load_server_config "$id"
+
+  # Build the capture filter: everything except the configured exceptions
+  # and the known leaks declared in $LOCAL_CONFIG.
+  local -a terms=()
+  local ip leak
+  for ip in "${EXCEPTIONS[@]:-}"; do terms+=("host $ip"); done
+  for leak in "${LEAKS[@]:-}"; do terms+=("$leak"); done
+  (( ${#terms[@]} > 0 )) || \
+    die "nothing to exclude: EXCEPTIONS and LEAKS are both empty"
+
+  local joined="" t
+  for t in "${terms[@]}"; do
+    if [[ -z "$joined" ]]; then joined="$t"; else joined="$joined or $t"; fi
+  done
+
+  local filter="not ($joined)"
+
+  echo "Watching for leaks on $REAL_IFACE (default via $def_dev, server $id$(server_label))" >&2
+  echo "Filter: $filter" >&2
+  exec tcpdump -i "$REAL_IFACE" -n -nn "$filter"
+}
+
 # ==================================================================
 # Colors (status output only)
 # ==================================================================
@@ -827,6 +881,8 @@ main() {
     use)     Use     "$arg" ;;
 
     status)  Status ;;
+
+    watch-leaks) WatchLeaks ;;
 
     run)     Run "$arg" ;;
 
