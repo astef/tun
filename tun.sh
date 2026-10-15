@@ -17,7 +17,7 @@ readonly UNIT_DIR="/etc/systemd/system"
 # Every *.sh file in $TUN_D_DIR is a Config Script, sourced by
 # load_config() in lexicographical order on every command. Their purpose
 # is to modify this script's global variables: SERVERS, EXCEPTIONS,
-# LEAKS, REAL_IFACE, REAL_GATEWAY (see "Global state" below).
+# LEAKS, REAL_IFACE, REAL_GATEWAY, TUN_MTU (see "Global state" below).
 #
 # Nothing here is auto-generated: create the scripts yourself (see
 # usage() / `$PROG help` for the format).
@@ -26,6 +26,14 @@ readonly UNIT_DIR="/etc/systemd/system"
 # own tun<id> interface, so they never collide.
 CLIENT_TUN_IP="10.10.0.2"
 SERVER_TUN_IP="10.10.0.1"
+
+# MTU applied to both ends of every tunnel (the local tun<id> and the
+# matching remote one). Defaults to 1420: full-size 1500-byte tunneled
+# packets are what makes OpenSSH's tun forwarding fall over under load
+# (see tasks/adjust_mtu.md for the analysis), and 1420 also leaves
+# headroom for the SSH transport itself. Override in a Config Script to
+# raise it on paths that are known to carry 1500 end to end.
+TUN_MTU="1420"
 
 # Kernel tun device names are tun0..tun255. Pick ids that don't clash
 # with any other VPN software on your machine.
@@ -96,6 +104,7 @@ Configuration:
     REAL_IFACE="wlp4s0"           # required
     REAL_GATEWAY="192.168.50.1"   # required
     LEAKS=( "ether multicast" "igmp" "arp" )   # optional, has a default
+    TUN_MTU=1420                  # optional, defaults to 1420
 
 Each id gets its own unit file $UNIT_DIR/tun-<id>.service, so ids
 are installed and removed independently.
@@ -134,6 +143,9 @@ load_config() {
 
   [[ -n "${REAL_IFACE:-}" && -n "${REAL_GATEWAY:-}" ]] || \
     die "REAL_IFACE/REAL_GATEWAY are not set; define them in a Config Script in $TUN_D_DIR (see '$PROG help')"
+
+  [[ "$TUN_MTU" =~ ^[0-9]+$ ]] && (( TUN_MTU >= 576 && TUN_MTU <= 65535 )) || \
+    die "TUN_MTU must be an integer in 576..65535: '$TUN_MTU'"
 
   # Gather and validate server ids, apply per-server defaults.
   local key ids=() id
@@ -232,6 +244,14 @@ service_failure_detail() {
 
 tun_exists() { ip link show "$1" &>/dev/null; }
 
+# Print the current MTU of tun<id>, or nothing when the device is
+# missing. Compared against $TUN_MTU to detect an MTU left over from an
+# older run that predates TUN_MTU.
+tun_mtu() {
+  ip link show dev "tun$1" 2>/dev/null \
+    | grep -o 'mtu [0-9]*' | head -1 | cut -d' ' -f2 || true
+}
+
 # True if tun<id> currently carries the expected point-to-point peer
 # address. Used to distinguish "ssh is up and the interface was
 # configured" from "ssh is up but the interface is bare".
@@ -253,12 +273,15 @@ configure_tun() {
 
   ip addr replace "$CLIENT_TUN_IP/32" peer "$SERVER_TUN_IP" dev "$tun_dev" \
     || die "cannot assign $CLIENT_TUN_IP peer $SERVER_TUN_IP on $tun_dev"
+  ip link set dev "$tun_dev" mtu "$TUN_MTU" \
+    || die "cannot set mtu $TUN_MTU on $tun_dev"
   ip link set "$tun_dev" up \
     || die "cannot bring $tun_dev up"
 
   ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=5 \
       "${user}@${host}" \
       "ip addr replace $SERVER_TUN_IP/32 peer $CLIENT_TUN_IP dev $tun_dev; \
+       ip link set dev $tun_dev mtu $TUN_MTU; \
        ip link set $tun_dev up" \
     || die "cannot configure remote end of $tun_dev on ${user}@${host}"
 }
@@ -571,6 +594,14 @@ Use() {
     configure_tun "$id"
   fi
 
+  # A tunnel left behind by an older run may still carry the kernel
+  # default MTU; bring it (and the remote end) in line with $TUN_MTU.
+  local mtu; mtu="$(tun_mtu "$id")"
+  if [[ -n "$mtu" && "$mtu" != "$TUN_MTU" ]]; then
+    echo "$tun_dev MTU is $mtu; reconfiguring for $TUN_MTU." >&2
+    configure_tun "$id"
+  fi
+
   ensure_exception_routes "$id"
   ip route replace default via "$SERVER_TUN_IP" dev "$tun_dev" \
     || die "$SERVER_TUN_IP is not reachable via $tun_dev (tunnel not ready)"
@@ -745,6 +776,16 @@ Status() {
     fi
     printf '    Host:              %s@%s:%s\n' "$user" "$host" "$port"
     printf '    Tun device:        %s\n' "$tun_dev"
+
+    if (( tun_up )); then
+      local tun_mtu; tun_mtu="$(tun_mtu "$id")"
+      if [[ -n "$tun_mtu" && "$tun_mtu" != "$TUN_MTU" ]]; then
+        printf '    Tun MTU:           %s (expected %s)\n' \
+          "$(paint yellow "$tun_mtu")" "$TUN_MTU"
+      else
+        printf '    Tun MTU:           %s\n' "$tun_mtu"
+      fi
+    fi
 
     if (( installed )); then
       printf '    Service installed: yes\n'
